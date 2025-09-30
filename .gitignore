@@ -1,0 +1,25 @@
+# Rust build
+/client/target
+/client/test-ledger
+/my-counter/target
+/client/cargo.lock
+/my-counter/cargo.lock
+/my-counter/test-ledger
+**/*.rs.bk
+
+# Anchor build artifacts
+/programs/**/target/
+**/*.so
+**/*.dSYM
+
+# Node / frontend stuff (if any)
+node_modules/
+dist/
+.env
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
