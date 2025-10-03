@@ -1,10 +1,12 @@
 # Rust build
 /client/target
 /client/test-ledger
+/client/src/old.main.rs
 /my-counter/target
 /client/cargo.lock
 /my-counter/cargo.lock
 /my-counter/test-ledger
+/my-counter/src/old.lib.rs
 **/*.rs.bk
 
 # Anchor build artifacts
