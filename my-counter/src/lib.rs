@@ -65,21 +65,37 @@ pub fn signup(
     password: String,
 ) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
-    let payer = next_account_info(accounts_iter)?; // signer paying for rent
-    let user_account = next_account_info(accounts_iter)?; // PDA account
+    let payer = next_account_info(accounts_iter)?;
+    let user_account = next_account_info(accounts_iter)?;
     let system_program = next_account_info(accounts_iter)?;
 
-    // If account not initialized, create it
+    let user_data = UserAccount {
+        username: username.clone(),
+        email: email.clone(),
+        password: password.clone(),
+    };
+
+    // Correct account size using Borsh serialization
+    let serialized_size = user_data.try_to_vec().unwrap().len();
+    let rent = Rent::get()?;
+    let lamports = rent.minimum_balance(serialized_size);
+
+    let (pda, bump) = Pubkey::find_program_address(&[username.as_bytes()], program_id);
+
+    if user_account.key != &pda {
+        msg!("Invalid PDA provided");
+        return Err(ProgramError::InvalidArgument);
+    }
+
     if user_account.data_is_empty() {
-        let rent = Rent::get()?;
-        let space = std::mem::size_of::<UserAccount>();
-        let lamports = rent.minimum_balance(space);
-
-        let (pda, bump) = Pubkey::find_program_address(&[username.as_bytes()], program_id);
-
-        // Create PDA
-        let create_ix =
-            system_instruction::create_account(payer.key, &pda, lamports, space as u64, program_id);
+        // Create account
+        let create_ix = system_instruction::create_account(
+            payer.key,
+            &pda,
+            lamports,
+            serialized_size as u64,
+            program_id,
+        );
 
         invoke_signed(
             &create_ix,
@@ -88,12 +104,7 @@ pub fn signup(
         )?;
     }
 
-    let user_data = UserAccount {
-        username: username.clone(),
-        email: email.clone(),
-        password: password.clone(),
-    };
-
+    // Serialize user data into account
     user_account.data.borrow_mut().fill(0);
     user_data.serialize(&mut &mut user_account.data.borrow_mut()[..])?;
 
