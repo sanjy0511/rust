@@ -41,7 +41,7 @@ pub fn process_instruction(
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
-    msg!("EntryPoint triggered...");
+    msg!("Entrypoint triggered");
 
     let instruction = UserInstruction::try_from_slice(instruction_data)
         .map_err(|_| ProgramError::InvalidInstructionData)?;
@@ -72,11 +72,9 @@ pub fn signup(
     let user_data = UserAccount {
         username: username.clone(),
         email: email.clone(),
-        password: password.clone(),
+        password,
     };
-
-    // Correct account size using Borsh serialization
-    let serialized_size = user_data.try_to_vec().unwrap().len();
+    let serialized_size = user_data.try_to_vec()?.len();
     let rent = Rent::get()?;
     let lamports = rent.minimum_balance(serialized_size);
 
@@ -88,7 +86,6 @@ pub fn signup(
     }
 
     if user_account.data_is_empty() {
-        // Create account
         let create_ix = system_instruction::create_account(
             payer.key,
             &pda,
@@ -104,7 +101,6 @@ pub fn signup(
         )?;
     }
 
-    // Serialize user data into account
     user_account.data.borrow_mut().fill(0);
     user_data.serialize(&mut &mut user_account.data.borrow_mut()[..])?;
 

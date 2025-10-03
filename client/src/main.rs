@@ -1,11 +1,12 @@
-use borsh::{BorshDeserialize, BorshSerialize};
+use borsh::BorshSerialize;
 use dotenv::dotenv;
-use my_counter::{UserAccount, UserInstruction};
+use my_counter::UserInstruction;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
     signature::{read_keypair_file, Signer},
+    system_program,
     transaction::Transaction,
 };
 use std::{
@@ -13,6 +14,15 @@ use std::{
     io::{self, Write},
 };
 
+// ---------------- Temporary DB Struct ----------------
+#[derive(Debug, Clone)]
+struct TempUser {
+    username: String,
+    email: String,
+    password: String,
+}
+
+// ---------------- MAIN ----------------
 fn main() {
     dotenv().ok();
 
@@ -22,9 +32,11 @@ fn main() {
         .parse()
         .unwrap();
     let payer_path = env::var("PAYER_PATH").expect("PAYER_PATH must be set");
-
     let client = RpcClient::new(rpc_url);
     let payer = read_keypair_file(payer_path).unwrap();
+
+    // Local in-memory DB
+    let mut temp_db: Vec<TempUser> = Vec::new();
 
     loop {
         println!("\n1. Signup\n2. Signin\n3. List Users\n4. Exit");
@@ -33,105 +45,114 @@ fn main() {
 
         let mut choice = String::new();
         io::stdin().read_line(&mut choice).unwrap();
-        let choice = choice.trim();
-
-        match choice {
-            "1" => signup_user(&client, &payer, &program_id),
-            "2" => signin_user(&client, &program_id),
-            "3" => list_users(&client, &program_id),
+        match choice.trim() {
+            "1" => signup(&client, &payer, &program_id, &mut temp_db),
+            "2" => signin(&client, &payer, &program_id, &temp_db),
+            "3" => list_users(&temp_db),
             "4" => break,
-            _ => println!("Invalid choice!"),
+            _ => println!("Invalid choice"),
         }
     }
 }
 
 // ---------------- Signup ----------------
-fn signup_user(
+fn signup(
     client: &RpcClient,
     payer: &solana_sdk::signer::keypair::Keypair,
     program_id: &Pubkey,
+    temp_db: &mut Vec<TempUser>,
 ) {
     let (username, email, password) = get_signup_details();
     let (pda, _bump) = Pubkey::find_program_address(&[username.as_bytes()], program_id);
 
-    let signup_ix = Instruction::new_with_bytes(
+    let ix = Instruction::new_with_bytes(
         *program_id,
         &UserInstruction::Signup {
-            username,
-            email,
-            password,
+            username: username.clone(),
+            email: email.clone(),
+            password: password.clone(),
         }
         .try_to_vec()
         .unwrap(),
         vec![
             AccountMeta::new(payer.pubkey(), true),
             AccountMeta::new(pda, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+            AccountMeta::new_readonly(system_program::id(), false),
         ],
     );
 
-    send_transaction(client, payer, &[signup_ix]);
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
+    tx.sign(&[payer], client.get_latest_blockhash().unwrap());
+
+    match client.send_and_confirm_transaction(&tx) {
+        Ok(sig) => {
+            println!("Signup success! Tx: {}", sig);
+            // store in local temp_db
+            temp_db.push(TempUser {
+                username,
+                email,
+                password,
+            });
+        }
+        Err(err) => println!("Signup failed: {:?}", err),
+    }
 }
 
 // ---------------- Signin ----------------
-fn signin_user(client: &RpcClient, program_id: &Pubkey) {
+fn signin(
+    client: &RpcClient,
+    payer: &solana_sdk::signer::keypair::Keypair,
+    program_id: &Pubkey,
+    temp_db: &Vec<TempUser>,
+) {
     let (username, password) = get_signin_details();
     let (pda, _bump) = Pubkey::find_program_address(&[username.as_bytes()], program_id);
 
-    match client.get_account_data(&pda) {
-        Ok(data) => {
-            if let Ok(user_account) = UserAccount::try_from_slice(&data) {
-                if user_account.username == username && user_account.password == password {
-                    println!("Signin success! Welcome, {}", username);
+    let ix = Instruction::new_with_bytes(
+        *program_id,
+        &UserInstruction::Signin {
+            username: username.clone(),
+            password: password.clone(),
+        }
+        .try_to_vec()
+        .unwrap(),
+        vec![AccountMeta::new(pda, false)],
+    );
+
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
+    tx.sign(&[payer], client.get_latest_blockhash().unwrap());
+
+    match client.send_and_confirm_transaction(&tx) {
+        Ok(sig) => {
+            println!("Signin Tx sent: {}", sig);
+            // also check from local temp_db
+            if let Some(user) = temp_db.iter().find(|u| u.username == username) {
+                if user.password == password {
+                    println!("Local check: Welcome back, {}", user.username);
                 } else {
-                    println!("Signin failed: Invalid username or password");
+                    println!("Local check: Wrong password");
                 }
             } else {
-                println!("Signin failed: Account data corrupted");
+                println!("Local check: User not found");
             }
         }
-        Err(_) => println!("Signin failed: User not found, please signup first"),
+        Err(err) => println!("Signin failed: {:?}", err),
     }
 }
 
 // ---------------- List Users ----------------
-fn list_users(client: &RpcClient, program_id: &Pubkey) {
-    match client.get_program_accounts(program_id) {
-        Ok(accounts) => {
-            if accounts.is_empty() {
-                println!("No users found.");
-            } else {
-                println!("Registered users:");
-                for (pubkey, account) in accounts {
-                    if let Ok(user) = UserAccount::try_from_slice(&account.data) {
-                        println!(
-                            "Username: {}, Email: {}, PDA: {}",
-                            user.username, user.email, pubkey
-                        );
-                    } else {
-                        println!("Failed to deserialize account: {}", pubkey);
-                    }
-                }
-            }
+fn list_users(temp_db: &Vec<TempUser>) {
+    if temp_db.is_empty() {
+        println!("No users signed up yet.");
+    } else {
+        println!("--- All Users ---");
+        for (i, user) in temp_db.iter().enumerate() {
+            println!("{}. {} ({})", i + 1, user.username, user.email);
         }
-        Err(err) => println!("Failed to fetch users: {:?}", err),
     }
 }
 
-// ---------------- Helpers ----------------
-fn send_transaction(
-    client: &RpcClient,
-    payer: &solana_sdk::signer::keypair::Keypair,
-    ixs: &[Instruction],
-) {
-    let mut tx = Transaction::new_with_payer(ixs, Some(&payer.pubkey()));
-    tx.sign(&[payer], client.get_latest_blockhash().unwrap());
-    match client.send_and_confirm_transaction(&tx) {
-        Ok(sig) => println!("Transaction success! Tx: {}", sig),
-        Err(e) => println!("Transaction failed: {:?}", e),
-    }
-}
-
+// ---------------- functions  ----------------
 fn get_signup_details() -> (String, String, String) {
     let mut username = String::new();
     let mut email = String::new();

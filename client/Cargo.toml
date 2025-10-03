@@ -10,6 +10,7 @@ solana-program = "1.17.18"
 borsh = "0.10.3"
 shellexpand = "3.1.0"
 dotenv = "0.15"
+rand = "0.8"
 my-counter = { path = "../my-counter" , features = ["client"]}
 
 
