@@ -30,6 +30,7 @@ fn main() {
         println!("\n1. Signup\n2. Signin\n3. List Users\n4. Exit");
         print!("Enter choice: ");
         io::stdout().flush().unwrap();
+
         let mut choice = String::new();
         io::stdin().read_line(&mut choice).unwrap();
 
@@ -88,7 +89,7 @@ fn signin(client: &RpcClient, payer: &solana_sdk::signer::keypair::Keypair, prog
     send_tx(client, payer, &[ix]);
 }
 
-// ------------------------ LIST USERS (fixed) ------------------------
+// ------------------------ LIST USERS ------------------------
 fn list_users_onchain(client: &RpcClient, program_id: &Pubkey) {
     let (registry_pda, _) = Pubkey::find_program_address(&[b"registry"], program_id);
     println!("Fetching users from registry PDA: {}", registry_pda);
@@ -96,13 +97,15 @@ fn list_users_onchain(client: &RpcClient, program_id: &Pubkey) {
     let account_data = match client.get_account_data(&registry_pda) {
         Ok(data) => data,
         Err(_) => {
-            println!(" No registry found on-chain. No users yet.");
+            println!("No registry found on-chain. No users yet.");
             return;
         }
     };
 
-    // === CHANGED: use deserialize_reader with a Cursor to ignore trailing padding ===
-    let mut cursor = Cursor::new(&account_data);
+    // Copy data to avoid BorrowMutError
+    let registry_data_copy: Vec<u8> = account_data.clone();
+    let mut cursor = Cursor::new(&registry_data_copy);
+
     let registry: UserRegistry = match UserRegistry::deserialize_reader(&mut cursor) {
         Ok(r) => r,
         Err(err) => {
@@ -119,18 +122,15 @@ fn list_users_onchain(client: &RpcClient, program_id: &Pubkey) {
     println!("--- Registered Users ---");
     for (index, user_pda) in registry.users.iter().enumerate() {
         match client.get_account_data(user_pda) {
-            Ok(user_data) => {
-                let mut u_cursor = Cursor::new(&user_data);
-                match UserAccount::deserialize_reader(&mut u_cursor) {
-                    Ok(user) => println!(
-                        "{}. Username: {}, Email: {}",
-                        index + 1,
-                        user.username,
-                        user.email
-                    ),
-                    Err(_) => println!("  Failed to deserialize user account {}", user_pda),
-                }
-            }
+            Ok(user_data) => match UserAccount::try_from_slice(&user_data) {
+                Ok(user) => println!(
+                    "{}. Username: {}, Email: {}",
+                    index + 1,
+                    user.username,
+                    user.email
+                ),
+                Err(_) => println!("  Failed to deserialize user account {}", user_pda),
+            },
             Err(_) => println!("  Could not fetch user account {}", user_pda),
         }
     }
@@ -141,8 +141,8 @@ fn send_tx(client: &RpcClient, payer: &solana_sdk::signer::keypair::Keypair, ix:
     let bh = client.get_latest_blockhash().unwrap();
     let tx = Transaction::new_signed_with_payer(ix, Some(&payer.pubkey()), &[payer], bh);
     match client.send_and_confirm_transaction(&tx) {
-        Ok(sig) => println!(" Transaction sent: {}", sig),
-        Err(e) => println!(" Error: {:?}", e),
+        Ok(sig) => println!("Transaction sent: {}", sig),
+        Err(e) => println!("Error: {:?}", e),
     }
 }
 

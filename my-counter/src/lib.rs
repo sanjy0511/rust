@@ -11,6 +11,7 @@ use solana_program::{
     system_instruction,
     sysvar::{rent::Rent, Sysvar},
 };
+use std::io::Cursor;
 
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct UserAccount {
@@ -91,7 +92,6 @@ pub fn signup(
     let rent = Rent::get()?;
     let lamports = rent.minimum_balance(user_size);
 
-    // Create user PDA if it doesn't exist
     if user_account.lamports() == 0 {
         msg!("Creating user PDA...");
         let create_user_ix = system_instruction::create_account(
@@ -108,12 +108,10 @@ pub fn signup(
         )?;
     }
 
-    // Serialize user data into the account
     user_account.data.borrow_mut().fill(0);
     user_data.serialize(&mut &mut user_account.data.borrow_mut()[..])?;
     msg!("User saved successfully!");
 
-    // Handle registry PDA
     let (registry_pda, registry_bump) = Pubkey::find_program_address(&[b"registry"], program_id);
     if registry_account.key != &registry_pda {
         msg!("Invalid registry PDA");
@@ -123,7 +121,6 @@ pub fn signup(
     let registry_space = 8192usize;
     let registry_lamports = rent.minimum_balance(registry_space);
 
-    // Create registry PDA if not exists
     if registry_account.lamports() == 0 {
         msg!("Creating new registry PDA...");
         let create_registry_ix = system_instruction::create_account(
@@ -148,18 +145,18 @@ pub fn signup(
         msg!("Empty registry initialized!");
     }
 
-    // Read existing registry
-    let mut registry = match UserRegistry::try_from_slice(&registry_account.data.borrow()) {
+    // Copy data out first to avoid double borrow
+    let registry_data_copy: Vec<u8> = registry_account.data.borrow().to_vec();
+    let mut registry = match UserRegistry::deserialize_reader(&mut Cursor::new(&registry_data_copy))
+    {
         Ok(r) => r,
         Err(_) => UserRegistry::default(),
     };
 
-    // Append new user if not already in registry
     if !registry.users.contains(&user_pda) {
         registry.users.push(user_pda);
     }
 
-    // Serialize back
     let serialized = registry.try_to_vec()?;
     let mut data_mut = registry_account.data.borrow_mut();
     data_mut[..serialized.len()].copy_from_slice(&serialized);
@@ -192,19 +189,20 @@ pub fn list_users(accounts: &[AccountInfo]) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
     let registry_account = next_account_info(accounts_iter)?;
 
-    let registry_data = registry_account.data.borrow();
-    if registry_data.is_empty() {
+    let registry_data_copy: Vec<u8> = registry_account.data.borrow().to_vec();
+    if registry_data_copy.is_empty() {
         msg!("Registry account empty!");
         return Ok(());
     }
 
-    let registry: UserRegistry = match UserRegistry::try_from_slice(&registry_data) {
-        Ok(r) => r,
-        Err(e) => {
-            msg!("Failed to deserialize registry: {:?}", e);
-            return Ok(());
-        }
-    };
+    let registry: UserRegistry =
+        match UserRegistry::deserialize_reader(&mut Cursor::new(&registry_data_copy)) {
+            Ok(r) => r,
+            Err(e) => {
+                msg!("Failed to deserialize registry: {:?}", e);
+                return Ok(());
+            }
+        };
 
     if registry.users.is_empty() {
         msg!("No users registered yet.");
