@@ -1,7 +1,6 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 #[cfg(not(feature = "client"))]
 use solana_program::entrypoint;
-
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
     entrypoint::ProgramResult,
@@ -13,6 +12,7 @@ use solana_program::{
     sysvar::{rent::Rent, Sysvar},
 };
 
+/// ---------------- USER STRUCT ----------------
 #[derive(BorshSerialize, BorshDeserialize, Debug)]
 pub struct UserAccount {
     pub username: String,
@@ -20,6 +20,13 @@ pub struct UserAccount {
     pub password: String,
 }
 
+/// ---------------- REGISTRY STRUCT ----------------
+#[derive(BorshSerialize, BorshDeserialize, Debug, Default)]
+pub struct UserRegistry {
+    pub users: Vec<Pubkey>,
+}
+
+/// ---------------- INSTRUCTION ENUM ----------------
 #[derive(BorshSerialize, BorshDeserialize, Debug)]
 pub enum UserInstruction {
     Signup {
@@ -31,17 +38,19 @@ pub enum UserInstruction {
         username: String,
         password: String,
     },
+    ListUsers,
 }
 
 #[cfg(not(feature = "client"))]
 entrypoint!(process_instruction);
 
+/// ---------------- ENTRYPOINT ----------------
 pub fn process_instruction(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
-    msg!("Entrypoint triggered");
+    msg!("Entrypoint Triggered");
 
     let instruction = UserInstruction::try_from_slice(instruction_data)
         .map_err(|_| ProgramError::InvalidInstructionData)?;
@@ -53,10 +62,11 @@ pub fn process_instruction(
             password,
         } => signup(program_id, accounts, username, email, password),
         UserInstruction::Signin { username, password } => signin(accounts, username, password),
+        UserInstruction::ListUsers => list_users(accounts),
     }
 }
 
-// ---------------- Signup ----------------
+/// ---------------- SIGNUP FUNCTION ----------------
 pub fn signup(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -67,48 +77,102 @@ pub fn signup(
     let accounts_iter = &mut accounts.iter();
     let payer = next_account_info(accounts_iter)?;
     let user_account = next_account_info(accounts_iter)?;
+    let registry_account = next_account_info(accounts_iter)?;
     let system_program = next_account_info(accounts_iter)?;
 
+    // Prepare user data
     let user_data = UserAccount {
         username: username.clone(),
         email: email.clone(),
         password,
     };
-    let serialized_size = user_data.try_to_vec()?.len();
+
+    let user_serialized_size = user_data.try_to_vec()?.len();
     let rent = Rent::get()?;
-    let lamports = rent.minimum_balance(serialized_size);
+    let user_lamports = rent.minimum_balance(user_serialized_size);
 
-    let (pda, bump) = Pubkey::find_program_address(&[username.as_bytes()], program_id);
-
-    if user_account.key != &pda {
-        msg!("Invalid PDA provided");
+    let (user_pda, user_bump) = Pubkey::find_program_address(&[username.as_bytes()], program_id);
+    if user_account.key != &user_pda {
+        msg!("Invalid PDA provided for user");
         return Err(ProgramError::InvalidArgument);
     }
 
+    // Create user account if not exists
     if user_account.data_is_empty() {
-        let create_ix = system_instruction::create_account(
+        msg!("Creating user PDA account...");
+        let create_user_ix = system_instruction::create_account(
             payer.key,
-            &pda,
-            lamports,
-            serialized_size as u64,
+            &user_pda,
+            user_lamports,
+            user_serialized_size as u64,
             program_id,
         );
-
         invoke_signed(
-            &create_ix,
+            &create_user_ix,
             &[payer.clone(), user_account.clone(), system_program.clone()],
-            &[&[username.as_bytes(), &[bump]]],
+            &[&[username.as_bytes(), &[user_bump]]],
         )?;
     }
 
+    // Write user data
     user_account.data.borrow_mut().fill(0);
     user_data.serialize(&mut &mut user_account.data.borrow_mut()[..])?;
+    msg!(" Signup success! Username: {}, Email: {}", username, email);
 
-    msg!("Signup success! Username: {}, Email: {}", username, email);
+    // ---------------- REGISTRY LOGIC ----------------
+    let (registry_pda, registry_bump) = Pubkey::find_program_address(&[b"registry"], program_id);
+    if registry_account.key != &registry_pda {
+        msg!("Invalid registry PDA");
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    let rent = Rent::get()?;
+    let registry_serialized_size = 4096;
+    let registry_lamports = rent.minimum_balance(registry_serialized_size);
+
+    // Create registry if not exists
+    if registry_account.data_is_empty() {
+        msg!("Creating registry PDA account...");
+        let create_registry_ix = system_instruction::create_account(
+            payer.key,
+            &registry_pda,
+            registry_lamports,
+            registry_serialized_size as u64,
+            program_id,
+        );
+        invoke_signed(
+            &create_registry_ix,
+            &[
+                payer.clone(),
+                registry_account.clone(),
+                system_program.clone(),
+            ],
+            &[&[b"registry", &[registry_bump]]],
+        )?;
+
+        let empty_registry = UserRegistry::default();
+        empty_registry.serialize(&mut &mut registry_account.data.borrow_mut()[..])?;
+        msg!("Initialized empty registry");
+    }
+
+    // Read registry safely
+    let mut registry: UserRegistry =
+        UserRegistry::try_from_slice(&registry_account.data.borrow()).unwrap_or_default();
+
+    // Avoid duplicates
+    if !registry.users.contains(&user_pda) {
+        registry.users.push(user_pda);
+    }
+
+    // Clean buffer before writing
+    registry_account.data.borrow_mut().fill(0);
+    registry.serialize(&mut &mut registry_account.data.borrow_mut()[..])?;
+    msg!("Registry updated successfully");
+
     Ok(())
 }
 
-// ---------------- Signin ----------------
+/// ---------------- SIGNIN FUNCTION ----------------
 pub fn signin(accounts: &[AccountInfo], username: String, password: String) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
     let user_account = next_account_info(accounts_iter)?;
@@ -123,4 +187,24 @@ pub fn signin(accounts: &[AccountInfo], username: String, password: String) -> P
         msg!("Signin failed: Invalid credentials");
         Err(ProgramError::InvalidAccountData)
     }
+}
+
+/// ---------------- LIST USERS FUNCTION ----------------
+pub fn list_users(accounts: &[AccountInfo]) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let registry_account = next_account_info(accounts_iter)?;
+
+    let registry: UserRegistry =
+        UserRegistry::try_from_slice(&registry_account.data.borrow()).unwrap_or_default();
+
+    if registry.users.is_empty() {
+        msg!("No users registered yet.");
+        return Ok(());
+    }
+
+    msg!("-------- Registered Users --------");
+    for user_pda in registry.users.iter() {
+        msg!("User PDA: {}", user_pda);
+    }
+    Ok(())
 }
