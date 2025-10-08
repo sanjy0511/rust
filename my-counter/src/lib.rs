@@ -12,21 +12,18 @@ use solana_program::{
     sysvar::{rent::Rent, Sysvar},
 };
 
-/// ---------------- USER STRUCT ----------------
-#[derive(BorshSerialize, BorshDeserialize, Debug)]
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct UserAccount {
     pub username: String,
     pub email: String,
     pub password: String,
 }
 
-/// ---------------- REGISTRY STRUCT ----------------
-#[derive(BorshSerialize, BorshDeserialize, Debug, Default)]
+#[derive(BorshSerialize, BorshDeserialize, Debug, Default, Clone)]
 pub struct UserRegistry {
     pub users: Vec<Pubkey>,
 }
 
-/// ---------------- INSTRUCTION ENUM ----------------
 #[derive(BorshSerialize, BorshDeserialize, Debug)]
 pub enum UserInstruction {
     Signup {
@@ -44,7 +41,6 @@ pub enum UserInstruction {
 #[cfg(not(feature = "client"))]
 entrypoint!(process_instruction);
 
-/// ---------------- ENTRYPOINT ----------------
 pub fn process_instruction(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -66,7 +62,6 @@ pub fn process_instruction(
     }
 }
 
-/// ---------------- SIGNUP FUNCTION ----------------
 pub fn signup(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -80,16 +75,11 @@ pub fn signup(
     let registry_account = next_account_info(accounts_iter)?;
     let system_program = next_account_info(accounts_iter)?;
 
-    // Prepare user data
     let user_data = UserAccount {
         username: username.clone(),
         email: email.clone(),
         password,
     };
-
-    let user_serialized_size = user_data.try_to_vec()?.len();
-    let rent = Rent::get()?;
-    let user_lamports = rent.minimum_balance(user_serialized_size);
 
     let (user_pda, user_bump) = Pubkey::find_program_address(&[username.as_bytes()], program_id);
     if user_account.key != &user_pda {
@@ -97,14 +87,18 @@ pub fn signup(
         return Err(ProgramError::InvalidArgument);
     }
 
-    // Create user account if not exists
-    if user_account.data_is_empty() {
-        msg!("Creating user PDA account...");
+    let user_size = user_data.try_to_vec()?.len();
+    let rent = Rent::get()?;
+    let lamports = rent.minimum_balance(user_size);
+
+    // Create user PDA if it doesn't exist
+    if user_account.lamports() == 0 {
+        msg!("Creating user PDA...");
         let create_user_ix = system_instruction::create_account(
             payer.key,
             &user_pda,
-            user_lamports,
-            user_serialized_size as u64,
+            lamports,
+            user_size as u64,
             program_id,
         );
         invoke_signed(
@@ -114,30 +108,29 @@ pub fn signup(
         )?;
     }
 
-    // Write user data
+    // Serialize user data into the account
     user_account.data.borrow_mut().fill(0);
     user_data.serialize(&mut &mut user_account.data.borrow_mut()[..])?;
-    msg!(" Signup success! Username: {}, Email: {}", username, email);
+    msg!("User saved successfully!");
 
-    // ---------------- REGISTRY LOGIC ----------------
+    // Handle registry PDA
     let (registry_pda, registry_bump) = Pubkey::find_program_address(&[b"registry"], program_id);
     if registry_account.key != &registry_pda {
         msg!("Invalid registry PDA");
         return Err(ProgramError::InvalidArgument);
     }
 
-    let rent = Rent::get()?;
-    let registry_serialized_size = 4096;
-    let registry_lamports = rent.minimum_balance(registry_serialized_size);
+    let registry_space = 8192usize;
+    let registry_lamports = rent.minimum_balance(registry_space);
 
-    // Create registry if not exists
-    if registry_account.data_is_empty() {
-        msg!("Creating registry PDA account...");
+    // Create registry PDA if not exists
+    if registry_account.lamports() == 0 {
+        msg!("Creating new registry PDA...");
         let create_registry_ix = system_instruction::create_account(
             payer.key,
             &registry_pda,
             registry_lamports,
-            registry_serialized_size as u64,
+            registry_space as u64,
             program_id,
         );
         invoke_signed(
@@ -150,29 +143,35 @@ pub fn signup(
             &[&[b"registry", &[registry_bump]]],
         )?;
 
-        let empty_registry = UserRegistry::default();
-        empty_registry.serialize(&mut &mut registry_account.data.borrow_mut()[..])?;
-        msg!("Initialized empty registry");
+        let empty = UserRegistry::default();
+        empty.serialize(&mut &mut registry_account.data.borrow_mut()[..])?;
+        msg!("Empty registry initialized!");
     }
 
-    // Read registry safely
-    let mut registry: UserRegistry =
-        UserRegistry::try_from_slice(&registry_account.data.borrow()).unwrap_or_default();
+    // Read existing registry
+    let mut registry = match UserRegistry::try_from_slice(&registry_account.data.borrow()) {
+        Ok(r) => r,
+        Err(_) => UserRegistry::default(),
+    };
 
-    // Avoid duplicates
+    // Append new user if not already in registry
     if !registry.users.contains(&user_pda) {
         registry.users.push(user_pda);
     }
 
-    // Clean buffer before writing
-    registry_account.data.borrow_mut().fill(0);
-    registry.serialize(&mut &mut registry_account.data.borrow_mut()[..])?;
-    msg!("Registry updated successfully");
+    // Serialize back
+    let serialized = registry.try_to_vec()?;
+    let mut data_mut = registry_account.data.borrow_mut();
+    data_mut[..serialized.len()].copy_from_slice(&serialized);
+
+    msg!(
+        "Registry updated successfully with {} users",
+        registry.users.len()
+    );
 
     Ok(())
 }
 
-/// ---------------- SIGNIN FUNCTION ----------------
 pub fn signin(accounts: &[AccountInfo], username: String, password: String) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
     let user_account = next_account_info(accounts_iter)?;
@@ -189,13 +188,23 @@ pub fn signin(accounts: &[AccountInfo], username: String, password: String) -> P
     }
 }
 
-/// ---------------- LIST USERS FUNCTION ----------------
 pub fn list_users(accounts: &[AccountInfo]) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
     let registry_account = next_account_info(accounts_iter)?;
 
-    let registry: UserRegistry =
-        UserRegistry::try_from_slice(&registry_account.data.borrow()).unwrap_or_default();
+    let registry_data = registry_account.data.borrow();
+    if registry_data.is_empty() {
+        msg!("Registry account empty!");
+        return Ok(());
+    }
+
+    let registry: UserRegistry = match UserRegistry::try_from_slice(&registry_data) {
+        Ok(r) => r,
+        Err(e) => {
+            msg!("Failed to deserialize registry: {:?}", e);
+            return Ok(());
+        }
+    };
 
     if registry.users.is_empty() {
         msg!("No users registered yet.");
@@ -203,8 +212,9 @@ pub fn list_users(accounts: &[AccountInfo]) -> ProgramResult {
     }
 
     msg!("-------- Registered Users --------");
-    for user_pda in registry.users.iter() {
-        msg!("User PDA: {}", user_pda);
+    for (i, user_pda) in registry.users.iter().enumerate() {
+        msg!("{}. User PDA: {}", i + 1, user_pda);
     }
+
     Ok(())
 }

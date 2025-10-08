@@ -11,12 +11,11 @@ use solana_sdk::{
 };
 use std::{
     env,
-    io::{self, Write},
+    io::{self, Cursor, Write},
 };
 
 fn main() {
     dotenv().ok();
-
     let rpc_url = env::var("RPC_URL").expect("RPC_URL must be set");
     let program_id: Pubkey = env::var("PROGRAM_ID")
         .expect("PROGRAM_ID must be set")
@@ -31,7 +30,6 @@ fn main() {
         println!("\n1. Signup\n2. Signin\n3. List Users\n4. Exit");
         print!("Enter choice: ");
         io::stdout().flush().unwrap();
-
         let mut choice = String::new();
         io::stdin().read_line(&mut choice).unwrap();
 
@@ -40,7 +38,7 @@ fn main() {
             "2" => signin(&client, &payer, &program_id),
             "3" => list_users_onchain(&client, &program_id),
             "4" => {
-                println!("Exiting...!");
+                println!("Exiting...");
                 break;
             }
             _ => println!("Invalid choice"),
@@ -48,19 +46,18 @@ fn main() {
     }
 }
 
-// ---------------- Signup ----------------
+// ------------------------ SIGNUP ------------------------
 fn signup(client: &RpcClient, payer: &solana_sdk::signer::keypair::Keypair, program_id: &Pubkey) {
     let (username, email, password) = get_signup_details();
-
-    let (user_pda, _bump) = Pubkey::find_program_address(&[username.as_bytes()], program_id);
-    let (registry_pda, _bump_registry) = Pubkey::find_program_address(&[b"registry"], program_id);
+    let (user_pda, _) = Pubkey::find_program_address(&[username.as_bytes()], program_id);
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"registry"], program_id);
 
     let ix = Instruction::new_with_bytes(
         *program_id,
         &UserInstruction::Signup {
-            username: username.clone(),
-            email: email.clone(),
-            password: password.clone(),
+            username,
+            email,
+            password,
         }
         .try_to_vec()
         .unwrap(),
@@ -72,54 +69,28 @@ fn signup(client: &RpcClient, payer: &solana_sdk::signer::keypair::Keypair, prog
         ],
     );
 
-    let recent_blockhash = client.get_latest_blockhash().unwrap();
-    let tx = Transaction::new_signed_with_payer(
-        &[ix],
-        Some(&payer.pubkey()),
-        &[payer],
-        recent_blockhash,
-    );
-
-    match client.send_and_confirm_transaction(&tx) {
-        Ok(sig) => println!("Signup success! Tx: {}", sig),
-        Err(err) => println!("Signup failed: {:?}", err),
-    }
+    send_tx(client, payer, &[ix]);
 }
 
-// ---------------- Signin ----------------
+// ------------------------ SIGNIN ------------------------
 fn signin(client: &RpcClient, payer: &solana_sdk::signer::keypair::Keypair, program_id: &Pubkey) {
     let (username, password) = get_signin_details();
-    let (user_pda, _bump) = Pubkey::find_program_address(&[username.as_bytes()], program_id);
+    let (user_pda, _) = Pubkey::find_program_address(&[username.as_bytes()], program_id);
 
     let ix = Instruction::new_with_bytes(
         *program_id,
-        &UserInstruction::Signin {
-            username: username.clone(),
-            password: password.clone(),
-        }
-        .try_to_vec()
-        .unwrap(),
+        &UserInstruction::Signin { username, password }
+            .try_to_vec()
+            .unwrap(),
         vec![AccountMeta::new(user_pda, false)],
     );
 
-    let recent_blockhash = client.get_latest_blockhash().unwrap();
-    let tx = Transaction::new_signed_with_payer(
-        &[ix],
-        Some(&payer.pubkey()),
-        &[payer],
-        recent_blockhash,
-    );
-
-    match client.send_and_confirm_transaction(&tx) {
-        Ok(sig) => println!(" Signin Tx sent: {}", sig),
-        Err(err) => println!(" Signin failed: {:?}", err),
-    }
+    send_tx(client, payer, &[ix]);
 }
 
-// ---------------- List Users ----------------
+// ------------------------ LIST USERS (fixed) ------------------------
 fn list_users_onchain(client: &RpcClient, program_id: &Pubkey) {
-    let (registry_pda, _bump_registry) = Pubkey::find_program_address(&[b"registry"], program_id);
-
+    let (registry_pda, _) = Pubkey::find_program_address(&[b"registry"], program_id);
     println!("Fetching users from registry PDA: {}", registry_pda);
 
     let account_data = match client.get_account_data(&registry_pda) {
@@ -130,55 +101,66 @@ fn list_users_onchain(client: &RpcClient, program_id: &Pubkey) {
         }
     };
 
-    // Safely attempt to deserialize registry
-    let registry: UserRegistry = match UserRegistry::try_from_slice(&account_data) {
-        Ok(reg) => reg,
+    // === CHANGED: use deserialize_reader with a Cursor to ignore trailing padding ===
+    let mut cursor = Cursor::new(&account_data);
+    let registry: UserRegistry = match UserRegistry::deserialize_reader(&mut cursor) {
+        Ok(r) => r,
         Err(err) => {
-            println!(" Failed to deserialize registry account: {:?}", err);
+            println!("Failed to deserialize registry account: {:?}", err);
             return;
         }
     };
 
     if registry.users.is_empty() {
-        println!("No users signed up yet.");
+        println!("No users registered yet.");
         return;
     }
 
-    println!("--- Registered Users On-Chain ---");
+    println!("--- Registered Users ---");
     for (index, user_pda) in registry.users.iter().enumerate() {
-        let user_data = match client.get_account_data(user_pda) {
-            Ok(data) => data,
-            Err(_) => {
-                println!(" Could not fetch user account {}", user_pda);
-                continue;
+        match client.get_account_data(user_pda) {
+            Ok(user_data) => {
+                let mut u_cursor = Cursor::new(&user_data);
+                match UserAccount::deserialize_reader(&mut u_cursor) {
+                    Ok(user) => println!(
+                        "{}. Username: {}, Email: {}",
+                        index + 1,
+                        user.username,
+                        user.email
+                    ),
+                    Err(_) => println!("  Failed to deserialize user account {}", user_pda),
+                }
             }
-        };
-
-        match UserAccount::try_from_slice(&user_data) {
-            Ok(user) => println!(
-                "{}. Username: {}, Email: {}",
-                index + 1,
-                user.username,
-                user.email
-            ),
-            Err(_) => println!(" Failed to deserialize user account {}", user_pda),
+            Err(_) => println!("  Could not fetch user account {}", user_pda),
         }
     }
 }
 
-// ---------------- Helper Functions ----------------
+// ------------------------ SEND TX ------------------------
+fn send_tx(client: &RpcClient, payer: &solana_sdk::signer::keypair::Keypair, ix: &[Instruction]) {
+    let bh = client.get_latest_blockhash().unwrap();
+    let tx = Transaction::new_signed_with_payer(ix, Some(&payer.pubkey()), &[payer], bh);
+    match client.send_and_confirm_transaction(&tx) {
+        Ok(sig) => println!(" Transaction sent: {}", sig),
+        Err(e) => println!(" Error: {:?}", e),
+    }
+}
+
+// ------------------------ INPUT HELPERS ------------------------
 fn get_signup_details() -> (String, String, String) {
     let mut username = String::new();
     let mut email = String::new();
     let mut password = String::new();
 
-    print!("Enter username: ");
+    print!("Username: ");
     io::stdout().flush().unwrap();
     io::stdin().read_line(&mut username).unwrap();
-    print!("Enter email: ");
+
+    print!("Email: ");
     io::stdout().flush().unwrap();
     io::stdin().read_line(&mut email).unwrap();
-    print!("Enter password: ");
+
+    print!("Password: ");
     io::stdout().flush().unwrap();
     io::stdin().read_line(&mut password).unwrap();
 
@@ -193,10 +175,11 @@ fn get_signin_details() -> (String, String) {
     let mut username = String::new();
     let mut password = String::new();
 
-    print!("Enter username: ");
+    print!("Username: ");
     io::stdout().flush().unwrap();
     io::stdin().read_line(&mut username).unwrap();
-    print!("Enter password: ");
+
+    print!("Password: ");
     io::stdout().flush().unwrap();
     io::stdin().read_line(&mut password).unwrap();
 
