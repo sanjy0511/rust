@@ -7,6 +7,9 @@ edition = "2021"
 borsh = "0.10.3"
 borsh-derive = "0.10.3"
 solana-program = "1.17.18"
+spl-token = { version = "3.5.0", default-features = false, features = ["no-entrypoint"] }
+
+
 
 [lib]
 crate-type = ["cdylib", "lib"]
