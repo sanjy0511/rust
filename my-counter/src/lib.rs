@@ -293,15 +293,14 @@ pub fn create_user_token_account(
     accounts: &[AccountInfo],
     username: String,
 ) -> ProgramResult {
-    msg!("=== On-chain Debug: CreateUserTokenAccount ===");
-
     let accounts_iter = &mut accounts.iter();
-    let payer = next_account_info(accounts_iter)?; // payer (signer)
-    let user_token_account = next_account_info(accounts_iter)?; // PDA
-    let mint_account = next_account_info(accounts_iter)?; // token mint
+    let payer = next_account_info(accounts_iter)?; // signer
+    let user_token_account = next_account_info(accounts_iter)?; // PDA token account
+    let mint_account = next_account_info(accounts_iter)?; // mint account
     let token_program = next_account_info(accounts_iter)?; // SPL token program
-    let system_program = next_account_info(accounts_iter)?; // System program
-    let rent_sysvar = next_account_info(accounts_iter)?; // Rent sysvar
+    let system_program = next_account_info(accounts_iter)?; // system program
+    let rent_sysvar = next_account_info(accounts_iter)?; // rent sysvar
+    let user_account = next_account_info(accounts_iter)?; // the actual user PDA
 
     // Derive PDAs
     let (user_pda, _user_bump) = Pubkey::find_program_address(&[username.as_bytes()], program_id);
@@ -309,27 +308,33 @@ pub fn create_user_token_account(
         Pubkey::find_program_address(&[username.as_bytes(), b"token"], program_id);
 
     if user_token_account.key != &user_token_pda {
-        msg!("ERROR: Invalid PDA provided for user token account");
+        msg!("ERROR: Invalid PDA for user token account");
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    if user_account.key != &user_pda {
+        msg!("ERROR: User PDA account missing");
         return Err(ProgramError::InvalidArgument);
     }
 
     if mint_account.data_is_empty() {
-        msg!("ERROR: Mint account not initialized!");
+        msg!("ERROR: Mint account not initialized");
         return Err(ProgramError::UninitializedAccount);
     }
 
     msg!("Creating token account for user: {}", username);
-    let rent = Rent::get()?;
-    let token_acc_size = spl_token::state::Account::LEN;
-    let lamports = rent.minimum_balance(token_acc_size);
 
-    // PDA signs via seeds
+    let rent = &Rent::from_account_info(rent_sysvar)?;
+    let token_account_size = spl_token::state::Account::LEN;
+    let lamports = rent.minimum_balance(token_account_size);
+
+    // Create token account PDA
     invoke_signed(
         &system_instruction::create_account(
             payer.key,
             user_token_account.key,
             lamports,
-            token_acc_size as u64,
+            token_account_size as u64,
             token_program.key,
         ),
         &[
@@ -340,24 +345,24 @@ pub fn create_user_token_account(
         &[&[username.as_bytes(), b"token", &[token_bump]]],
     )?;
 
-    msg!("Initializing token account...");
+    // Initialize token account
     invoke(
         &spl_token::instruction::initialize_account(
             token_program.key,
             user_token_account.key,
             mint_account.key,
-            &user_pda, // owner
+            &user_pda, // owner is user PDA
         )?,
         &[
             user_token_account.clone(),
             mint_account.clone(),
-            payer.clone(),
-            token_program.clone(),
+            user_account.clone(), // pass the user PDA as owner
             rent_sysvar.clone(),
+            token_program.clone(),
         ],
     )?;
 
-    msg!(" User token account created successfully!");
+    msg!("User token account created successfully!");
     Ok(())
 }
 

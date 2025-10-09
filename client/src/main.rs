@@ -188,20 +188,10 @@ fn create_user_token_account(
     program_id: &Pubkey,
 ) {
     let username = get_input("Enter username: ");
-    let mint_pubkey: Pubkey = get_input("Enter Mint Pubkey: ").parse().unwrap();
-
-    let (user_token_pda, _bump) =
+    let (user_pda, _bump) = Pubkey::find_program_address(&[username.as_bytes()], program_id);
+    let (user_token_pda, _token_bump) =
         Pubkey::find_program_address(&[username.as_bytes(), b"token"], program_id);
-
-    println!("=== DEBUG INFO ===");
-    println!("Username: {}", username);
-    println!("Mint Pubkey: {}", mint_pubkey);
-    println!("User Token PDA: {}", user_token_pda);
-    println!("Program ID: {}", program_id);
-    println!("Payer: {}", payer.pubkey());
-
-    let token_program_pubkey = Pubkey::new_from_array(spl_token::id().to_bytes());
-    let rent_sysvar_pubkey = solana_sdk::sysvar::rent::id();
+    let mint_pubkey: Pubkey = get_input("Enter Mint Pubkey: ").parse().unwrap();
 
     let ix = Instruction::new_with_bytes(
         *program_id,
@@ -214,9 +204,13 @@ fn create_user_token_account(
             AccountMeta::new(payer.pubkey(), true),
             AccountMeta::new(user_token_pda, false),
             AccountMeta::new(mint_pubkey, false),
-            AccountMeta::new_readonly(token_program_pubkey, false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false),
             AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(rent_sysvar_pubkey, false),
+            AccountMeta::new_readonly(
+                Pubkey::new_from_array(solana_sdk::sysvar::rent::id().to_bytes()),
+                false,
+            ),
+            AccountMeta::new(user_pda, false), // user PDA
         ],
     );
 
