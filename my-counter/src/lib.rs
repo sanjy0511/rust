@@ -71,10 +71,10 @@ pub fn signup(
     password: String,
 ) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
-    let payer = next_account_info(accounts_iter)?;
-    let user_account = next_account_info(accounts_iter)?;
-    let registry_account = next_account_info(accounts_iter)?;
-    let system_program = next_account_info(accounts_iter)?;
+    let payer = next_account_info(accounts_iter)?; // creating the user account.
+    let user_account = next_account_info(accounts_iter)?; // Retrieves the account where user-specific data will be stored.
+    let registry_account = next_account_info(accounts_iter)?; //Refers to a central registry account that keeps track of all users.
+    let system_program = next_account_info(accounts_iter)?; //Needed when you want to create new accounts or transfer SOL.
 
     let user_data = UserAccount {
         username: username.clone(),
@@ -83,6 +83,7 @@ pub fn signup(
     };
 
     let (user_pda, user_bump) = Pubkey::find_program_address(&[username.as_bytes()], program_id);
+    //PDAs are special addresses controlled by your program, not by a private key.
     if user_account.key != &user_pda {
         msg!("Invalid PDA provided for user");
         return Err(ProgramError::InvalidArgument);
@@ -106,6 +107,7 @@ pub fn signup(
             &[payer.clone(), user_account.clone(), system_program.clone()],
             &[&[username.as_bytes(), &[user_bump]]],
         )?;
+        //User PDA => user-ku unique account, store personal data.
     }
 
     user_account.data.borrow_mut().fill(0);
@@ -139,6 +141,7 @@ pub fn signup(
             ],
             &[&[b"registry", &[registry_bump]]],
         )?;
+        //Registry PDA => Single account, track ellam user PDAs globally.
 
         let empty = UserRegistry::default();
         empty.serialize(&mut &mut registry_account.data.borrow_mut()[..])?;
