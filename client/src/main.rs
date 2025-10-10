@@ -301,7 +301,7 @@ fn mint_to_user(
 //         .try_to_vec()
 //         .unwrap(),
 //         vec![
-//             AccountMeta::new(from_pda, true), // ✅ sender PDA (authority)
+//             AccountMeta::new(from_pda, true), //  sender PDA (authority)
 //             AccountMeta::new(from_token_account, false),
 //             AccountMeta::new(to_pda, false),
 //             AccountMeta::new(to_token_account, false),
