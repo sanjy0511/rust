@@ -9,6 +9,7 @@ use solana_sdk::{
     system_program,
     transaction::Transaction,
 };
+use spl_associated_token_account as ata;
 use std::{
     env,
     io::{self, Cursor, Write},
@@ -27,7 +28,7 @@ fn main() {
     let payer = read_keypair_file(payer_path).unwrap();
 
     loop {
-        println!("\n=== MENU ===");
+        println!("\n=== MENU ===\n");
         println!("1. Signup");
         println!("2. Signin");
         println!("3. List Users");
@@ -86,7 +87,7 @@ fn signup(client: &RpcClient, payer: &solana_sdk::signer::keypair::Keypair, prog
 }
 
 // ---------------- SIGNIN ----------------
-fn signin(client: &RpcClient, _payer: &solana_sdk::signer::keypair::Keypair, program_id: &Pubkey) {
+fn signin(client: &RpcClient, payer: &solana_sdk::signer::keypair::Keypair, program_id: &Pubkey) {
     let (username, password) = get_signin_details();
     let (user_pda, _) = Pubkey::find_program_address(&[username.as_bytes()], program_id);
 
@@ -98,7 +99,7 @@ fn signin(client: &RpcClient, _payer: &solana_sdk::signer::keypair::Keypair, pro
         vec![AccountMeta::new(user_pda, false)],
     );
 
-    send_tx(client, _payer, &[ix]);
+    send_tx(client, payer, &[ix]);
 }
 
 // ---------------- LIST USERS ----------------
@@ -146,7 +147,7 @@ fn list_users_onchain(client: &RpcClient, program_id: &Pubkey) {
     }
 }
 
-// ---------------- TOKEN LOGIC ----------------
+// ---------------- CREATE CURRENCY ----------------
 fn create_currency(
     client: &RpcClient,
     payer: &solana_sdk::signer::keypair::Keypair,
@@ -158,27 +159,37 @@ fn create_currency(
     io::stdin().read_line(&mut input).unwrap();
     let total_supply: u64 = input.trim().parse().unwrap_or(100000);
 
+    // generate new mint keypair
     let mint = solana_sdk::signature::Keypair::new();
     println!("Mint Pubkey: {}", mint.pubkey());
 
-    let token_program_pubkey = Pubkey::new_from_array(spl_token::id().to_bytes());
+    // derive MintData PDA
+    let (mint_data_pda, _) = Pubkey::find_program_address(&[mint.pubkey().as_ref()], program_id);
+
+    let token_program_pubkey = spl_token::id();
     let rent_sysvar_pubkey = solana_sdk::sysvar::rent::id();
 
+    // Construct instruction to create currency
     let ix = Instruction::new_with_bytes(
         *program_id,
         &UserInstruction::CreateCurrency { total_supply }
             .try_to_vec()
             .unwrap(),
         vec![
-            AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new(mint.pubkey(), true),
+            AccountMeta::new(payer.pubkey(), true), // payer signs
+            AccountMeta::new(mint.pubkey(), true),  // mint must sign
+            AccountMeta::new(mint_data_pda, false), // mint data PDA store pannum total supply
             AccountMeta::new_readonly(token_program_pubkey, false),
             AccountMeta::new_readonly(rent_sysvar_pubkey, false),
             AccountMeta::new_readonly(system_program::id(), false),
         ],
     );
 
-    send_tx_multi_signer(client, &[payer, &mint], &[ix]);
+    // send transaction with both payer and mint as signers
+    send_tx_multi_signer(&client, &[&payer, &mint], &[ix]);
+
+    println!("Currency created with total supply {}", total_supply);
+    println!("MintData PDA: {}", mint_data_pda);
 }
 
 // ---------------- CREATE USER TOKEN ACCOUNT ----------------
@@ -188,102 +199,123 @@ fn create_user_token_account(
     program_id: &Pubkey,
 ) {
     let username = get_input("Enter username: ");
-    let (user_pda, _bump) = Pubkey::find_program_address(&[username.as_bytes()], program_id);
-    let (user_token_pda, _token_bump) =
-        Pubkey::find_program_address(&[username.as_bytes(), b"token"], program_id);
-    let mint_pubkey: Pubkey = get_input("Enter Mint Pubkey: ").parse().unwrap();
+    let mint_pubkey_input = get_input("Enter Mint Pubkey: ");
+    let mint_pubkey: Pubkey = mint_pubkey_input.parse().expect("Invalid mint pubkey");
+
+    let (user_pda, _) = Pubkey::find_program_address(&[username.as_bytes()], program_id);
+    let token_account = ata::get_associated_token_address(&user_pda, &mint_pubkey);
+
+    println!("User token account will be: {}", token_account);
 
     let ix = Instruction::new_with_bytes(
         *program_id,
         &UserInstruction::CreateUserTokenAccount {
             username: username.clone(),
+            mint: mint_pubkey,
         }
         .try_to_vec()
         .unwrap(),
         vec![
             AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new(user_token_pda, false),
-            AccountMeta::new(mint_pubkey, false),
-            AccountMeta::new_readonly(Pubkey::new_from_array(spl_token::id().to_bytes()), false),
+            AccountMeta::new(user_pda, false),
+            AccountMeta::new(token_account, false),
+            AccountMeta::new_readonly(mint_pubkey, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
             AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(
-                Pubkey::new_from_array(solana_sdk::sysvar::rent::id().to_bytes()),
-                false,
-            ),
-            AccountMeta::new(user_pda, false), // user PDA
+            AccountMeta::new_readonly(solana_sdk::sysvar::rent::id(), false),
+            AccountMeta::new_readonly(ata::id(), false),
         ],
     );
 
-    println!("Sending transaction...");
     send_tx(client, payer, &[ix]);
+    println!("User token account created for {}", username);
 }
 
-// ---------------- MINT ----------------
+// ---------------- MINT TO USER ----------------
 fn mint_to_user(
     client: &RpcClient,
     payer: &solana_sdk::signer::keypair::Keypair,
     program_id: &Pubkey,
 ) {
     let username = get_input("Enter username: ");
-    let mint_pubkey: Pubkey = get_input("Enter Mint Pubkey: ").parse().unwrap();
-    let user_token_account: Pubkey = get_input("Enter User Token Account Pubkey: ")
-        .parse()
-        .unwrap();
-    let amount: u64 = get_input("Enter amount to mint: ").parse().unwrap();
+    let mint_pubkey_input = get_input("Enter Mint Pubkey: ");
+    let mint_pubkey: Pubkey = mint_pubkey_input.parse().expect("Invalid mint pubkey");
+    let amount_input = get_input("Enter amount to mint: ");
+    let amount: u64 = amount_input.parse().expect("Invalid amount");
 
-    let token_program_pubkey = Pubkey::new_from_array(spl_token::id().to_bytes());
+    let (user_pda, _) = Pubkey::find_program_address(&[username.as_bytes()], program_id);
+    let user_token_account = ata::get_associated_token_address(&user_pda, &mint_pubkey);
 
-    let ix = Instruction::new_with_bytes(
-        *program_id,
-        &UserInstruction::MintToUser { username, amount }
-            .try_to_vec()
-            .unwrap(),
-        vec![
-            AccountMeta::new(mint_pubkey, false),
-            AccountMeta::new(user_token_account, false),
-            AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new_readonly(token_program_pubkey, false),
-        ],
-    );
-
-    send_tx(client, payer, &[ix]);
-}
-
-// ---------------- TRANSFER ----------------
-fn transfer_to_user(
-    client: &RpcClient,
-    payer: &solana_sdk::signer::keypair::Keypair,
-    program_id: &Pubkey,
-) {
-    let from_token_account: Pubkey = get_input("Enter From User Token Account Pubkey: ")
-        .parse()
-        .unwrap();
-    let to_token_account: Pubkey = get_input("Enter To User Token Account Pubkey: ")
-        .parse()
-        .unwrap();
-    let amount: u64 = get_input("Enter amount to transfer: ").parse().unwrap();
-
-    let token_program_pubkey = Pubkey::new_from_array(spl_token::id().to_bytes());
+    // derive MintData PDA
+    let (mint_data_pda, _) = Pubkey::find_program_address(&[mint_pubkey.as_ref()], program_id);
 
     let ix = Instruction::new_with_bytes(
         *program_id,
-        &UserInstruction::TransferToUser {
-            from_username: "".to_string(),
-            to_username: "".to_string(),
+        &UserInstruction::MintToUser {
+            username: username.clone(),
+            mint: mint_pubkey,
             amount,
         }
         .try_to_vec()
         .unwrap(),
         vec![
-            AccountMeta::new(from_token_account, false),
-            AccountMeta::new(to_token_account, false),
-            AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new_readonly(token_program_pubkey, false),
+            AccountMeta::new(payer.pubkey(), true), //signs (true) — transaction payer & mint authority.
+            AccountMeta::new(user_pda, false),      //(PDA) read-only entry.
+            AccountMeta::new(user_token_account, false), // (ATA) where tokens will land.
+            AccountMeta::new(mint_pubkey, false),   //mint account.
+            AccountMeta::new(mint_data_pda, false), //supply tracking PDA.
+            AccountMeta::new_readonly(spl_token::id(), false), //read-only — token program reference.
         ],
     );
 
     send_tx(client, payer, &[ix]);
+    println!("Attempted to mint {} tokens to {}", amount, username);
 }
+
+//----------------- TRANSFER TO USER -----------------
+// fn transfer_to_user(
+//     client: &RpcClient,
+//     payer: &solana_sdk::signer::keypair::Keypair,
+//     program_id: &Pubkey,
+// ) {
+//     let from_username = get_input("Enter sender username: ");
+//     let to_username = get_input("Enter a recipient username: ");
+//     let mint_pubkey_input = get_input("Enter Mint Pubkey: ");
+//     let mint_pubkey: Pubkey = mint_pubkey_input.parse().expect("Invalid mint pubkey");
+//     let amount_input = get_input("Enter amount to transfer: ");
+//     let amount: u64 = amount_input.parse().expect("Invalid amount");
+
+//     let (from_pda, _) = Pubkey::find_program_address(&[from_username.as_bytes()], program_id);
+//     let from_token_account = ata::get_associated_token_address(&from_pda, &mint_pubkey);
+//     let (to_pda, _) = Pubkey::find_program_address(&[to_username.as_bytes()], program_id);
+//     let to_token_account = ata::get_associated_token_address(&to_pda, &mint_pubkey);
+
+//     let ix = Instruction::new_with_bytes(
+//         *program_id,
+//         &UserInstruction::TransferToUser {
+//             from_username: from_username.clone(),
+//             to_username: to_username.clone(),
+//             mint: mint_pubkey,
+//             amount,
+//         }
+//         .try_to_vec()
+//         .unwrap(),
+//         vec![
+//             AccountMeta::new(from_pda, true), // ✅ sender PDA (authority)
+//             AccountMeta::new(from_token_account, false),
+//             AccountMeta::new(to_pda, false),
+//             AccountMeta::new(to_token_account, false),
+//             AccountMeta::new_readonly(spl_token::id(), false),
+//         ],
+//     );
+
+//     send_tx(client, payer, &[ix]);
+
+//     println!(
+//         "Attempted to transfer {} tokens from {} to {}",
+//         amount, from_username, to_username
+//     );
+// }
 
 // ---------------- COMMON TX HELPERS ----------------
 fn send_tx(client: &RpcClient, payer: &solana_sdk::signer::keypair::Keypair, ix: &[Instruction]) {

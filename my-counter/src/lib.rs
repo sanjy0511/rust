@@ -12,6 +12,7 @@ use solana_program::{
     system_instruction,
     sysvar::{rent::Rent, Sysvar},
 };
+use spl_associated_token_account::instruction as ata_instruction;
 use spl_token::instruction as token_instruction;
 use std::io::Cursor;
 
@@ -25,6 +26,12 @@ pub struct UserAccount {
 #[derive(BorshSerialize, BorshDeserialize, Debug, Default, Clone)]
 pub struct UserRegistry {
     pub users: Vec<Pubkey>,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct MintData {
+    pub total_supply: u64,
+    pub current_supply: u64,
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Debug)]
@@ -44,14 +51,17 @@ pub enum UserInstruction {
     },
     CreateUserTokenAccount {
         username: String,
+        mint: Pubkey,
     },
     MintToUser {
         username: String,
+        mint: Pubkey,
         amount: u64,
     },
     TransferToUser {
         from_username: String,
         to_username: String,
+        mint: Pubkey,
         amount: u64,
     },
 }
@@ -77,18 +87,30 @@ pub fn process_instruction(
         } => signup(program_id, accounts, username, email, password),
         UserInstruction::Signin { username, password } => signin(accounts, username, password),
         UserInstruction::ListUsers => list_users(accounts),
-        UserInstruction::CreateCurrency { total_supply } => create_currency(accounts, total_supply),
-        UserInstruction::CreateUserTokenAccount { username } => {
-            create_user_token_account(program_id, accounts, username)
+        UserInstruction::CreateCurrency { total_supply } => {
+            create_currency(program_id, accounts, total_supply)
         }
-        UserInstruction::MintToUser { username, amount } => {
-            mint_to_user(program_id, accounts, username, amount)
+        UserInstruction::CreateUserTokenAccount { username, mint } => {
+            create_user_token_account(program_id, accounts, username, mint)
         }
+        UserInstruction::MintToUser {
+            username,
+            mint,
+            amount,
+        } => mint_to_user(program_id, accounts, username, mint, amount),
         UserInstruction::TransferToUser {
             from_username,
             to_username,
+            mint,
             amount,
-        } => transfer_to_user(program_id, accounts, from_username, to_username, amount),
+        } => transfer_to_user(
+            program_id,
+            accounts,
+            from_username,
+            to_username,
+            mint,
+            amount,
+        ),
     }
 }
 
@@ -142,6 +164,7 @@ pub fn signup(
     user_data.serialize(&mut &mut user_account.data.borrow_mut()[..])?;
     msg!("User saved successfully!");
 
+    // Registry PDA
     let (registry_pda, registry_bump) = Pubkey::find_program_address(&[b"registry"], program_id);
     if registry_account.key != &registry_pda {
         msg!("Invalid registry PDA");
@@ -245,10 +268,15 @@ pub fn list_users(accounts: &[AccountInfo]) -> ProgramResult {
 }
 
 // ---------------- TOKEN FUNCTIONS ----------------
-pub fn create_currency(accounts: &[AccountInfo], total_supply: u64) -> ProgramResult {
+pub fn create_currency(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    total_supply: u64,
+) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
     let payer = next_account_info(accounts_iter)?;
     let mint_account = next_account_info(accounts_iter)?;
+    let mint_data_account = next_account_info(accounts_iter)?; // PDA to store MintData
     let token_program = next_account_info(accounts_iter)?;
     let rent_sysvar = next_account_info(accounts_iter)?;
 
@@ -256,8 +284,9 @@ pub fn create_currency(accounts: &[AccountInfo], total_supply: u64) -> ProgramRe
     let mint_size = spl_token::state::Mint::LEN;
     let lamports = rent.minimum_balance(mint_size);
 
-    msg!("Creating Mint Token...!");
+    msg!("Creating Mint account...");
     invoke(
+        //Token program ah owner-a assign pannum.
         &system_instruction::create_account(
             payer.key,
             mint_account.key,
@@ -268,14 +297,14 @@ pub fn create_currency(accounts: &[AccountInfo], total_supply: u64) -> ProgramRe
         &[payer.clone(), mint_account.clone()],
     )?;
 
-    msg!("Initializing Mint...!");
+    msg!("Initializing Mint...");
     invoke(
         &token_instruction::initialize_mint(
-            token_program.key,
-            mint_account.key,
-            payer.key,
-            None,
-            0,
+            token_program.key, // which token program to use
+            mint_account.key,  // which mint account to initialize
+            payer.key,         // mint authority (who can mint new tokens)
+            None,              // freeze authority (optional; None = no freeze authority)
+            0,                 // decimal places (0 = no fractional tokens)
         )?,
         &[
             mint_account.clone(),
@@ -284,6 +313,39 @@ pub fn create_currency(accounts: &[AccountInfo], total_supply: u64) -> ProgramRe
         ],
     )?;
 
+    // MintData PDA using program_id
+    let (mint_data_pda, mint_data_bump) =
+        Pubkey::find_program_address(&[mint_account.key.as_ref()], program_id);
+
+    if mint_data_account.key != &mint_data_pda {
+        msg!("Invalid MintData PDA");
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    let mint_data = MintData {
+        total_supply,
+        current_supply: 0,
+    };
+    let size = mint_data.try_to_vec()?.len();
+    let lamports_mintdata = rent.minimum_balance(size);
+
+    if mint_data_account.lamports() == 0 {
+        msg!("Creating MintData PDA...");
+        let ix = system_instruction::create_account(
+            payer.key,
+            &mint_data_pda,
+            lamports_mintdata,
+            size as u64,
+            program_id,
+        );
+        invoke_signed(
+            &ix,
+            &[payer.clone(), mint_data_account.clone()],
+            &[&[mint_account.key.as_ref(), &[mint_data_bump]]],
+        )?;
+    }
+
+    mint_data.serialize(&mut &mut mint_data_account.data.borrow_mut()[..])?;
     msg!("Currency created with total supply {}", total_supply);
     Ok(())
 }
@@ -292,147 +354,171 @@ pub fn create_user_token_account(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     username: String,
+    mint: Pubkey,
 ) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
-    let payer = next_account_info(accounts_iter)?; // signer
-    let user_token_account = next_account_info(accounts_iter)?; // PDA token account
-    let mint_account = next_account_info(accounts_iter)?; // mint account
-    let token_program = next_account_info(accounts_iter)?; // SPL token program
-    let system_program = next_account_info(accounts_iter)?; // system program
-    let rent_sysvar = next_account_info(accounts_iter)?; // rent sysvar
-    let user_account = next_account_info(accounts_iter)?; // the actual user PDA
+    let payer = next_account_info(accounts_iter)?;
+    let user_account = next_account_info(accounts_iter)?; //PDA derived from username
+    let token_account = next_account_info(accounts_iter)?; //user’s associated token account (ATA)
+    let mint_account = next_account_info(accounts_iter)?; //which token mint this account belongs to
+    let token_program = next_account_info(accounts_iter)?; //To handle token logic (mint, transfer, ATA, etc.)
+    let system_program = next_account_info(accounts_iter)?; //To create accounts / fund lamports
+    let rent_sysvar = next_account_info(accounts_iter)?; //to check rent exemption balance
+    let ata_program = next_account_info(accounts_iter)?; //To auto-create token accounts for users
 
-    // Derive PDAs
-    let (user_pda, _user_bump) = Pubkey::find_program_address(&[username.as_bytes()], program_id);
-    let (user_token_pda, token_bump) =
-        Pubkey::find_program_address(&[username.as_bytes(), b"token"], program_id);
-
-    if user_token_account.key != &user_token_pda {
-        msg!("ERROR: Invalid PDA for user token account");
-        return Err(ProgramError::InvalidArgument);
-    }
+    let (user_pda, _) = Pubkey::find_program_address(&[username.as_bytes()], program_id);
 
     if user_account.key != &user_pda {
-        msg!("ERROR: User PDA account missing");
+        msg!("Invalid User PDA");
         return Err(ProgramError::InvalidArgument);
     }
 
-    if mint_account.data_is_empty() {
-        msg!("ERROR: Mint account not initialized");
-        return Err(ProgramError::UninitializedAccount);
-    }
+    msg!("Creating associated token account for user {}", username);
 
-    msg!("Creating token account for user: {}", username);
-
-    let rent = &Rent::from_account_info(rent_sysvar)?;
-    let token_account_size = spl_token::state::Account::LEN;
-    let lamports = rent.minimum_balance(token_account_size);
-
-    // Create token account PDA
-    invoke_signed(
-        &system_instruction::create_account(
+    invoke(
+        &ata_instruction::create_associated_token_account(
             payer.key,
-            user_token_account.key,
-            lamports,
-            token_account_size as u64,
+            &user_pda,
+            &mint,
             token_program.key,
         ),
         &[
             payer.clone(),
-            user_token_account.clone(),
-            system_program.clone(),
-        ],
-        &[&[username.as_bytes(), b"token", &[token_bump]]],
-    )?;
-
-    // Initialize token account
-    invoke(
-        &spl_token::instruction::initialize_account(
-            token_program.key,
-            user_token_account.key,
-            mint_account.key,
-            &user_pda, // owner is user PDA
-        )?,
-        &[
-            user_token_account.clone(),
+            token_account.clone(),
+            user_account.clone(),
             mint_account.clone(),
-            user_account.clone(), // pass the user PDA as owner
-            rent_sysvar.clone(),
+            system_program.clone(),
             token_program.clone(),
+            rent_sysvar.clone(),
+            ata_program.clone(),
+            //Instruction-ku required accounts list.
         ],
     )?;
 
-    msg!("User token account created successfully!");
+    msg!("User Token Account created successfully!");
     Ok(())
 }
 
 pub fn mint_to_user(
-    _program_id: &Pubkey,
+    program_id: &Pubkey,
     accounts: &[AccountInfo],
     username: String,
+    _mint: Pubkey,
     amount: u64,
 ) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
-    let mint_account = next_account_info(accounts_iter)?;
-    let user_token_account = next_account_info(accounts_iter)?;
-    let mint_authority = next_account_info(accounts_iter)?;
-    let token_program = next_account_info(accounts_iter)?;
+    let payer = next_account_info(accounts_iter)?; //(transaction signer).
+    let user_account = next_account_info(accounts_iter)?; //should be the User PDA
+    let user_token_account = next_account_info(accounts_iter)?; //the user's ATA — token account to credit.
+    let mint_account = next_account_info(accounts_iter)?; //the SPL mint account (the token definition).
+    let mint_data_account = next_account_info(accounts_iter)?; //the MintData PDA account where you stored total_supply and current_supply
+    let token_program = next_account_info(accounts_iter)?; // SPL Token Program account (for CPI).
+
+    let (user_pda, _bump) = Pubkey::find_program_address(&[username.as_bytes()], program_id);
+    if user_account.key != &user_pda {
+        msg!("Invalid user PDA");
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    // Deserialize mint data
+    let mut mint_data: MintData = MintData::try_from_slice(&mint_data_account.data.borrow())
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    // Check supply limit
+    if mint_data.current_supply + amount > mint_data.total_supply {
+        msg!(
+            "Cannot mint {} tokens. Exceeds total supply of {}",
+            amount,
+            mint_data.total_supply
+        );
+        return Err(ProgramError::Custom(0));
+    }
+
+    msg!("Minting {} tokens to {}", amount, user_token_account.key);
+
+    let ix = token_instruction::mint_to(
+        token_program.key,
+        mint_account.key,
+        user_token_account.key,
+        payer.key,
+        &[],
+        amount,
+    )?;
 
     invoke(
-        &token_instruction::mint_to(
-            token_program.key,
-            mint_account.key,
-            user_token_account.key,
-            mint_authority.key,
-            &[],
-            amount,
-        )?,
+        &ix,
         &[
             mint_account.clone(),
             user_token_account.clone(),
-            mint_authority.clone(),
+            payer.clone(),
             token_program.clone(),
         ],
     )?;
 
-    msg!("Minted {} tokens to user {}", amount, username);
-    Ok(())
-}
+    mint_data.current_supply += amount;
+    mint_data.serialize(&mut &mut mint_data_account.data.borrow_mut()[..])?;
 
-pub fn transfer_to_user(
-    _program_id: &Pubkey,
-    accounts: &[AccountInfo],
-    from_username: String,
-    to_username: String,
-    amount: u64,
-) -> ProgramResult {
-    let accounts_iter = &mut accounts.iter();
-    let from_token_account = next_account_info(accounts_iter)?;
-    let to_token_account = next_account_info(accounts_iter)?;
-    let authority = next_account_info(accounts_iter)?;
-    let token_program = next_account_info(accounts_iter)?;
-
-    invoke(
-        &token_instruction::transfer(
-            token_program.key,
-            from_token_account.key,
-            to_token_account.key,
-            authority.key,
-            &[],
-            amount,
-        )?,
-        &[
-            from_token_account.clone(),
-            to_token_account.clone(),
-            authority.clone(),
-            token_program.clone(),
-        ],
-    )?;
     msg!(
-        "Transferred {} tokens from {} to {}",
-        amount,
-        from_username,
-        to_username
+        "Tokens minted successfully! Current supply: {}",
+        mint_data.current_supply
     );
     Ok(())
 }
+
+// pub fn transfer_to_user(
+//     program_id: &Pubkey,
+//     accounts: &[AccountInfo],
+//     from_username: String,
+//     to_username: String,
+//     _mint: Pubkey,
+//     amount: u64,
+// ) -> ProgramResult {
+//     let accounts_iter = &mut accounts.iter();
+//     let sender_account = next_account_info(accounts_iter)?; // PDA of sender (authority)
+//     let sender_token_account = next_account_info(accounts_iter)?; // sender's ATA
+//     let recipient_account = next_account_info(accounts_iter)?; // PDA of receiver
+//     let recipient_token_account = next_account_info(accounts_iter)?; // receiver's ATA
+//     let token_program = next_account_info(accounts_iter)?; // SPL token program
+
+//     let (sender_pda, sender_bump) =
+//         Pubkey::find_program_address(&[from_username.as_bytes()], program_id);
+//     let (recipient_pda, _recipient_bump) =
+//         Pubkey::find_program_address(&[to_username.as_bytes()], program_id);
+
+//     if sender_account.key != &sender_pda || recipient_account.key != &recipient_pda {
+//         msg!("Invalid PDA for sender or recipient");
+//         return Err(ProgramError::InvalidArgument);
+//     }
+
+//     msg!(
+//         "Transferring {} tokens from {} to {}",
+//         amount,
+//         from_username,
+//         to_username
+//     );
+
+//     // Construct the transfer instruction
+//     let ix = token_instruction::transfer(
+//         token_program.key,
+//         sender_token_account.key,
+//         recipient_token_account.key,
+//         sender_account.key, // authority = PDA
+//         &[],
+//         amount,
+//     )?;
+
+//     // Use invoke_signed so PDA can sign using seeds
+//     invoke_signed(
+//         &ix,
+//         &[
+//             sender_token_account.clone(),
+//             recipient_token_account.clone(),
+//             sender_account.clone(),
+//             token_program.clone(),
+//         ],
+//         &[&[from_username.as_bytes(), &[sender_bump]]], // PDA seeds for signing
+//     )?;
+
+//     msg!("Transfer successful!");
+//     Ok(())
+// }
